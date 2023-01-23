@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # pylint: disable=too-few-public-methods,invalid-name
+# needed: python3 python3-yaml 
 
 """
 A Wi-Fi device presence detector for Home Assistant that runs on OpenWRT
@@ -7,13 +8,10 @@ A Wi-Fi device presence detector for Home Assistant that runs on OpenWRT
 
 import argparse
 import json
-import signal
 import subprocess
 import syslog
 import time
-from threading import Thread
 from typing import Dict, Any, List, Callable, Optional
-
 from urllib import request
 from urllib.error import URLError, HTTPError
 
@@ -21,14 +19,17 @@ from urllib.error import URLError, HTTPError
 class Logger:
     """Class to handle logging to syslog"""
 
-    def __init__(self, enable_debug: bool) -> None:
+    def __init__(self, enable_debug: bool, log2stdout: bool=False) -> None:
         self.enable_debug = enable_debug
+        self.log2stdout = log2stdout
 
     def log(self, text: str, is_debug: bool = False) -> None:
         """Log a line to syslog. Only log debug messages when debugging is enabled."""
         if is_debug and not self.enable_debug:
             return
-
+        if self.log2stdout:
+            print(text)
+            return
         level = syslog.LOG_DEBUG if is_debug else syslog.LOG_INFO
         syslog.openlog(
             ident="presence-detector",
@@ -43,9 +44,12 @@ class Settings:
 
     def __init__(self, config_file: str) -> None:
         self._settings = {
-            "hass_url": "http://homeassistant.local:8123",
-            "interfaces": ["hostapd.wlan0"],
+            "hass_url": "http://ha:8123",
             "do_not_track": [],
+            "must_track": [],
+            "only_track": [],
+            "device_min_dawn_score": 0,
+            "device_must_5g": False,
             "params": {},
             "offline_after": 3,
             "poll_interval": 15,
@@ -61,17 +65,17 @@ class Settings:
         return self._settings.get(item)
 
 
-class PresenceDetector(Thread):
+class PresenceDetector:
     """Presence detector that uses ubus polling to detect online devices"""
 
-    def __init__(self, config_file: str) -> None:
-        super().__init__()
+    def __init__(self, config_file: str, debug: bool = False, log2stdout: bool=False) -> None:
         self._settings = Settings(config_file)
-        self._logger = Logger(self._settings.debug)
         self._full_sync_counter = self._settings.full_sync_polls
         self._clients_seen: Dict[str, int] = {}
-        self._watchers: List[UbusWatcher] = []
-        self._killed = False
+        debug = debug | self._settings.debug
+        self._logger = Logger(debug, log2stdout)
+        for mac in self._settings.must_track:
+            self._clients_seen[mac] = 0
 
     @staticmethod
     def _post(url: str, data: dict, headers: dict):
@@ -90,7 +94,8 @@ class PresenceDetector(Thread):
         else:
             location = self._settings.away
 
-        body = {"mac": client, "location_name": location, "source_type": "router"}
+        body = {"mac": client, "location_name": location, 
+                "source_type": self._settings.source}
         if client in self._settings.params:
             body.update(self._settings.params[client])
 
@@ -101,15 +106,14 @@ class PresenceDetector(Thread):
                 headers={"Authorization": f"Bearer {self._settings.hass_token}"},
             )
             self._logger.log(f"API Response: {response.content!r}", is_debug=True)
-        except (URLError, HTTPError) as ex:
-            self._logger.log(str(ex), is_debug=True)
+        #except (URLError, HTTPError) as ex:
+        except Exception as ex:
+            self._logger.log(str(ex))
             # Force full sync when HA returns
             self._full_sync_counter = 0
             return False
-
         if not response.ok:
             self._full_sync_counter = 0
-
         return response.ok
 
     def full_sync(self) -> None:
@@ -136,13 +140,16 @@ class PresenceDetector(Thread):
             # Call failed -> retry next time
             self._clients_seen[client] = 1
 
-    def set_client_home(self, client: str):
+    def set_client_home(self, client: str, ap_addr: str):
         """Mark a client as home in HA"""
         if client in self._settings.do_not_track:
             return
-        # Add ap prefix if ap_name defined in settings
-        if self._settings.ap_name:
-            client = f"{self._settings.ap_name}_{client}"
+        if self._settings.only_track and client not in self._settings.only_track:
+            return
+        # Add ap prefix if ap_addr defined in settings
+        #ap_loc = ""
+        #if ap_addr in self._settings.ap2room:
+        #    ap_loc = self._settings.ap2room[ap_addr]
         if client not in self._clients_seen:
             self._logger.log(f"Device {client} is now at {self._settings.location}")
             if self._ha_seen(client):
@@ -153,20 +160,18 @@ class PresenceDetector(Thread):
     def _get_all_online_clients(self) -> Dict[str, Any]:
         """Call ubus and get all online clients"""
         clients = {}
-        for interface in self._settings.interfaces:
-            process = subprocess.run(
-                ["ubus", "call", interface, "get_clients"],
-                capture_output=True,
-                text=True,
-                check=False,
+        process = subprocess.run(
+            ["ubus", "call", "dawn", "get_hearing_map"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if process.returncode != 0:
+            self._logger.log(
+                f"Error running ubus for `ubus call dawn get_hearing_map`: {process.stderr}"
             )
-            if process.returncode != 0:
-                self._logger.log(
-                    f"Error running ubus for interface {interface}: {process.stderr}"
-                )
-                continue
-            response = json.loads(process.stdout)
-            clients.update(response["clients"])
+        response = json.loads(process.stdout)
+        clients.update( response[self._settings.ssid] )
         return clients
 
     def _on_leave(self, client: str):
@@ -174,43 +179,35 @@ class PresenceDetector(Thread):
         if self._settings.offline_after <= 1:
             self.set_client_away(client)
 
-    def start_watchers(self):
-        """Start ubus watcher threads for every interface"""
-        for interface in self._settings.interfaces:
-            # Start an ubus watcher for every interface
-            watcher = UbusWatcher(interface, self.set_client_home, self._on_leave)
-            watcher.start()
-            self._watchers.append(watcher)
 
-    def stop_watchers(self):
-        """Signal all ubus watchers to stop"""
-        for watcher in self._watchers:
-            watcher.stop()
-
-    @property
-    def stopped(self):
-        """Should this Thread be stopped?"""
-        return self._killed
-
-    def stop(self, _signum: Optional[int] = None, _frame: Optional[int] = None):
-        """Stop this thread as soon as possible"""
-        self._logger.log("Stopping...")
-        self.stop_watchers()
-        self._killed = True
-
+    @staticmethod
+    def _get_ap_highest_score(json_now):
+        ap_highest_score = -99
+        ap_highest = ""
+        for ap in json_now:
+            if json_now[ap]["score"] > ap_highest_score:
+                ap_highest_score = json_now[ap]["score"]
+                ap_highest = ap
+        return ap_highest, ap_highest_score
+    
     def run(self) -> None:
         """Main loop for the presence detector"""
-        # Start ubus watcher(s) for every interface
-        self.start_watchers()
 
         # The main (sync) polling loop
-        while not self._killed:
+        while True:
             seen_now = self._get_all_online_clients()
             # Periodically perform a full sync of all clients in case of connection failure
             self.full_sync()
             # Perform a regular 'changes only' sync with HA
             for client in seen_now:
-                self.set_client_home(client)
+                if(self._settings.device_must_5g):
+                    if(seen_now[client]["channel_utilization"] < 15): continue
+                ap_name, highest_dawn_score = self._get_ap_highest_score(seen_now[client])
+                # First time showup must has high dawn score
+                if(client in self._clients_seen or 
+                    highest_dawn_score < self._settings.device_min_dawn_score):
+                    continue
+                self.set_client_home(client, ap_name)
 
             # Mark unseen clients as away after 'offline_after' intervals
             for client in self._clients_seen.copy():
@@ -226,58 +223,7 @@ class PresenceDetector(Thread):
 
             self._logger.log(f"Clients seen: {self._clients_seen}", is_debug=True)
 
-
-class UbusWatcher(Thread):
-    """Watches live ubus events and signals presence detector of leave/join events"""
-
-    def __init__(
-        self,
-        interface: str,
-        on_join: Callable[[str], None],
-        on_leave: Callable[[str], None],
-    ) -> None:
-        super().__init__()
-        self._on_join = on_join
-        self._on_leave = on_leave
-        self._interface = interface
-        self._killed = False
-
-    def stop(self):
-        """Stops this watcher thread"""
-        self._killed = True
-
-    def run(self) -> None:
-        """Main loop for the ubus event watcher thread"""
-        while not self._killed:
-            # pylint: disable=consider-using-with
-            ubus = subprocess.Popen(
-                ["ubus", "subscribe", self._interface],
-                stdout=subprocess.PIPE,
-                text=True,
-            )
-            # Give ubus time to start and/or fail
-            time.sleep(1)
-            # Check if it failed to start
-            return_code = ubus.poll()
-            if return_code is not None or ubus.stdout is None:
-                # Starting ubus failed -> interface does not exist (yet)? let's retry later
-                ubus.wait()
-                continue
-            # Startup OK, start reading stdout
-            while not self._killed:
-                line = ubus.stdout.readline()
-                event = {}
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    # Ignore incomplete / invalid json
-                    pass
-                if "assoc" in event:
-                    self._on_join(event["assoc"]["address"])
-                elif "disassoc" in event:
-                    self._on_leave(event["disassoc"]["address"])
-            ubus.terminate()
-            ubus.wait()
+  
 
 
 def main():
@@ -289,15 +235,12 @@ def main():
         help="Filename of configuration file",
         default="/etc/config/presence-detector.settings.json",
     )
+    parser.add_argument( "--debug", action='store_true', default=False )
+    parser.add_argument( "--log2stdout", action='store_true', default=False )
     args = parser.parse_args()
+    detector = PresenceDetector(config_file=args.config, debug=args.debug, log2stdout=args.log2stdout)
+    detector.run()
 
-    detector = PresenceDetector(args.config)
-    detector.start()
-    signal.signal(signal.SIGTERM, detector.stop)
-    signal.signal(signal.SIGINT, detector.stop)
-
-    while not detector.stopped:
-        time.sleep(1)
 
 
 if __name__ == "__main__":
